@@ -91,3 +91,5 @@ strict_optional = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+[tool.vercel]
+entrypoint = "api:app"
