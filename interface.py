@@ -1,0 +1,326 @@
+import re
+import base64
+import gradio as gr
+from pathlib import Path
+import time
+import shutil
+from typing import AsyncGenerator, List, Optional, Tuple
+from gradio import ChatMessage
+
+
+class ChatInterface:
+    """
+    A chat interface for interacting with a medical AI agent through Gradio.
+
+    Handles file uploads, message processing, and chat history management.
+    Supports both regular image files and DICOM medical imaging files.
+    """
+
+    def __init__(self, agent, tools_dict):
+        """
+        Initialize the chat interface.
+
+        Args:
+            agent: The medical AI agent to handle requests
+            tools_dict (dict): Dictionary of available tools for image processing
+        """
+        self.agent = agent
+        self.tools_dict = tools_dict
+        self.upload_dir = Path("temp")
+        self.upload_dir.mkdir(exist_ok=True)
+        self.current_thread_id = None
+        # Separate storage for original and display paths
+        self.original_file_path = None  # For LLM (.dcm or other)
+        self.display_file_path = None  # For UI (always viewable format)
+
+    def handle_upload(self, file_path: str) -> str:
+        """
+        Handle new file upload and set appropriate paths.
+
+        Args:
+            file_path (str): Path to the uploaded file
+
+        Returns:
+            str: Display path for UI, or None if no file uploaded
+        """
+        if not file_path:
+            return None
+
+        try:
+            source = Path(file_path)
+            timestamp = int(time.time())
+
+            # Save original file with proper suffix
+            suffix = source.suffix.lower()
+            
+            # Validate file format
+            supported_formats = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.dcm']
+            if suffix not in supported_formats:
+                print(f"Unsupported file format: {suffix}")
+                return None
+                
+            saved_path = self.upload_dir / f"upload_{timestamp}{suffix}"
+            shutil.copy2(file_path, saved_path)  # Use file_path directly instead of source
+            self.original_file_path = str(saved_path)
+
+            # Handle DICOM conversion for display only
+            if suffix == ".dcm":
+                if "DicomProcessorTool" in self.tools_dict:
+                    output, _ = self.tools_dict["DicomProcessorTool"]._run(str(saved_path))
+                    # Tool may return an error dictionary on failure
+                    if isinstance(output, dict) and output.get("image_path"):
+                        self.display_file_path = output["image_path"]
+                    else:
+                        raise RuntimeError("DICOM tool returned no image_path")
+                else:
+                    # Fallback: minimal local conversion so UI preview always works
+                    try:
+                        import pydicom  # type: ignore
+                        import numpy as np  # type: ignore
+                        from PIL import Image  # type: ignore
+                        dcm = pydicom.dcmread(str(saved_path))
+                        img = dcm.pixel_array.astype(float)
+                        # Simple min-max normalize to 0-255
+                        img = ((img - img.min()) / (max(img.max() - img.min(), 1e-6)) * 255).astype(np.uint8)
+                        out_path = self.upload_dir / f"fallback_{timestamp}.png"
+                        Image.fromarray(img).save(out_path)
+                        self.display_file_path = str(out_path)
+                        print("DICOM fallback conversion used for display preview")
+                    except Exception as conv_e:
+                        print(f"DicomProcessorTool not available and fallback failed: {conv_e}")
+                        return None
+            else:
+                self.display_file_path = str(saved_path)
+
+            print(f"File uploaded successfully: {self.display_file_path}")
+            return self.display_file_path
+            
+        except Exception as e:
+            print(f"Error handling file upload: {e}")
+            return None
+
+    def add_message(
+        self, message: str, display_image: str, history: List[dict]
+    ) -> Tuple[List[dict], gr.Textbox]:
+        """
+        Add a new message to the chat history.
+
+        Args:
+            message (str): Text message to add
+            display_image (str): Path to image being displayed
+            history (List[dict]): Current chat history
+
+        Returns:
+            Tuple[List[dict], gr.Textbox]: Updated history and textbox component
+        """
+        image_path = self.original_file_path or display_image
+        if image_path is not None:
+            history.append({"role": "user", "content": {"path": image_path}})
+        if message is not None:
+            history.append({"role": "user", "content": message})
+        return history, gr.Textbox(value=message, interactive=False)
+
+    async def process_message(
+        self, message: str, display_image: Optional[str], chat_history: List[ChatMessage]
+    ) -> AsyncGenerator[Tuple[List[ChatMessage], Optional[str], str], None]:
+        """
+        Process a message and generate responses.
+
+        Args:
+            message (str): User message to process
+            display_image (Optional[str]): Path to currently displayed image
+            chat_history (List[ChatMessage]): Current chat history
+
+        Yields:
+            Tuple[List[ChatMessage], Optional[str], str]: Updated chat history, display path, and empty string
+        """
+        chat_history = chat_history or []
+
+        # Initialize thread if needed
+        if not self.current_thread_id:
+            self.current_thread_id = str(time.time())
+
+        messages = []
+        image_path = self.original_file_path or display_image
+
+        if image_path is not None:
+            # Send path for tools
+            messages.append({"role": "user", "content": f"image_path: {image_path}"})
+
+            # Load and encode image for multimodal
+            try:
+                with open(image_path, "rb") as img_file:
+                    img_base64 = base64.b64encode(img_file.read()).decode("utf-8")
+
+                # Determine correct MIME type based on file extension
+                file_ext = Path(image_path).suffix.lower()
+                if file_ext in ['.jpg', '.jpeg']:
+                    mime_type = "image/jpeg"
+                elif file_ext in ['.png']:
+                    mime_type = "image/png"
+                elif file_ext in ['.gif']:
+                    mime_type = "image/gif"
+                elif file_ext in ['.webp']:
+                    mime_type = "image/webp"
+                else:
+                    mime_type = "image/png"  # Default to PNG for unknown formats
+
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime_type};base64,{img_base64}"},
+                            }
+                        ],
+                    }
+                )
+            except Exception as e:
+                print(f"Error processing image {image_path}: {e}")
+                # Add text message about image processing error
+                messages.append({"role": "user", "content": f"Error loading image: {image_path}"})
+
+        if message is not None:
+            messages.append({"role": "user", "content": [{"type": "text", "text": message}]})
+
+        try:
+            for event in self.agent.workflow.stream(
+                {"messages": messages}, {"configurable": {"thread_id": self.current_thread_id}}
+            ):
+                if isinstance(event, dict):
+                    if "process" in event:
+                        content = event["process"]["messages"][-1].content
+                        if content:
+                            # Remove tool-call style lines and headings from the model output
+                            content = re.sub(r"temp/[^\s]*", "", content)
+                            # Drop bracketed log lines like: [Calling ...] or [tool output: ...]
+                            content = re.sub(r"^\s*\[[^\]]+\]\s*$", "", content, flags=re.MULTILINE)
+                            # Trim markdown headers used by some models
+                            content = re.sub(r"^\s*#+\s*", "", content, flags=re.MULTILINE)
+                            chat_history.append(ChatMessage(role="assistant", content=content.strip()))
+                            yield chat_history, self.display_file_path, ""
+
+                    elif "execute" in event:
+                        for message in event["execute"]["messages"]:
+                            tool_name = message.name
+                            tool_result = eval(message.content)[0]
+
+                            # Suppress textual tool result messages; only update images silently
+                            if tool_name == "image_visualizer" and isinstance(tool_result, dict):
+                                if tool_result.get("image_path"):
+                                    self.display_file_path = tool_result["image_path"]
+                                    chat_history.append(ChatMessage(role="assistant", content={"path": self.display_file_path}))
+
+                            elif tool_name == "chest_xray_segmentation" and isinstance(tool_result, dict):
+                                if tool_result.get("segmentation_image_path"):
+                                    segmented_image_path = tool_result["segmentation_image_path"]
+                                    self.display_file_path = segmented_image_path
+                                    chat_history.append(ChatMessage(role="assistant", content={"path": segmented_image_path}))
+
+                            # Other tools: no direct textual emission to user; keep UI clean
+
+                            yield chat_history, self.display_file_path, ""
+
+        except Exception as e:
+            chat_history.append(
+                ChatMessage(
+                    role="assistant", content=f"❌ Error: {str(e)}", metadata={"title": "Error"}
+                )
+            )
+            yield chat_history, self.display_file_path,""
+
+
+def create_demo(agent, tools_dict):
+    """
+    Create a Gradio demo interface for the medical AI agent.
+
+    Args:
+        agent: The medical AI agent to handle requests
+        tools_dict (dict): Dictionary of available tools for image processing
+
+    Returns:
+        gr.Blocks: Gradio Blocks interface
+    """
+    interface = ChatInterface(agent, tools_dict)
+
+    with gr.Blocks(theme=gr.themes.Soft()) as demo:
+        with gr.Column():
+            gr.Markdown(
+                """
+            # 🏥 MedRAX
+            Medical Reasoning Agent for Chest X-ray
+            """
+            )
+
+            with gr.Row():
+                with gr.Column(scale=3):
+                    chatbot = gr.Chatbot(
+                        [],
+                        height=800,
+                        container=True,
+                        show_label=True,
+                        elem_classes="chat-box",
+                        type="messages",
+                        label="Agent",
+                        avatar_images=(
+                            None,
+                            "assets/medrax_logo.jpg",
+                        ),
+                    )
+                    with gr.Row():
+                        with gr.Column(scale=3):
+                            txt = gr.Textbox(
+                                show_label=False,
+                                placeholder="Ask about the X-ray...",
+                                container=False,
+                            )
+
+                with gr.Column(scale=3):
+                    image_display = gr.Image(
+                        label="Image", type="filepath", height=700, container=True
+                    )
+                    with gr.Row():
+                        upload_button = gr.UploadButton(
+                            "📎 Upload X-Ray",
+                            file_types=["image"],
+                        )
+                        dicom_upload = gr.UploadButton(
+                            "📄 Upload DICOM",
+                            file_types=["file"],
+                        )
+                    with gr.Row():
+                        clear_btn = gr.Button("Clear Chat")
+                        new_thread_btn = gr.Button("New Thread")
+
+        # Event handlers
+        def clear_chat():
+            interface.original_file_path = None
+            interface.display_file_path = None
+            return [], None
+
+        def new_thread():
+            interface.current_thread_id = str(time.time())
+            return [], interface.display_file_path
+
+        def handle_file_upload(file):
+            return interface.handle_upload(file.name)
+
+        chat_msg = txt.submit(
+            interface.add_message, inputs=[txt, image_display, chatbot], outputs=[chatbot, txt]
+        )
+        bot_msg = chat_msg.then(
+            interface.process_message,
+            inputs=[txt, image_display, chatbot],
+            outputs=[chatbot, image_display, txt],
+        )
+        bot_msg.then(lambda: gr.Textbox(interactive=True), None, [txt])
+
+        upload_button.upload(handle_file_upload, inputs=upload_button, outputs=image_display)
+
+        dicom_upload.upload(handle_file_upload, inputs=dicom_upload, outputs=image_display)
+
+        clear_btn.click(clear_chat, outputs=[chatbot, image_display])
+        new_thread_btn.click(new_thread, outputs=[chatbot, image_display])
+
+    return demo
